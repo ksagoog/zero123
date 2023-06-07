@@ -30,6 +30,24 @@ from rich import print
 from transformers import AutoFeatureExtractor #, CLIPImageProcessor
 from torch import autocast
 from torchvision import transforms
+import os
+
+
+def get_idx(scan_path):
+    basename, _ = os.path.splitext(os.path.basename(scan_path))
+    return int(basename)
+
+
+def central_crop(raw_im):
+    h,w = raw_im.size
+    s = min(h,w)
+    oh = (h - s)//2
+    ow = (w - s) // 2
+    # raw_im.crop([ow, oh, w - ow, h - oh])
+    # display(raw_im)
+    new_raw_im = raw_im.crop([oh, ow, h - oh, w - ow])
+    new_raw_im = new_raw_im.resize((s,s))
+    return new_raw_im
 
 
 _SHOW_DESC = True
@@ -108,6 +126,27 @@ def sample_model(input_im, model, sampler, precision, h, w, ddim_steps, n_sample
             # samples_ddim = torch.nn.functional.interpolate(samples_ddim, 64, mode='nearest', antialias=False)
             x_samples_ddim = model.decode_first_stage(samples_ddim)
             return torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0).cpu()
+
+import cv2
+def get_pose(all_cam, i):
+    P = all_cam["world_mat_" + str(i)]
+    P = P[:3]
+
+    K, R, t = cv2.decomposeProjectionMatrix(P)[:3]
+    K = K / K[2, 2]
+
+    pose = np.eye(4, dtype=np.float32)
+    pose[:3, :3] = R.transpose()
+    pose[:3, 3] = (t[:3] / t[3])[:, 0]
+
+    scale_mtx = all_cam.get("scale_mat_" + str(i))
+    if scale_mtx is not None:
+        norm_trans = scale_mtx[:3, 3:]
+        norm_scale = np.diagonal(scale_mtx[:3, :3])[..., None]
+
+        pose[:3, 3:] -= norm_trans
+        pose[:3, 3:] /= norm_scale
+    return pose
 
 
 class CameraVisualizer:
@@ -309,6 +348,94 @@ def preprocess_image(models, input_im, preprocess):
     return input_im
 
 
+def main_run_v2(models, device,
+             x=0.0, y=0.0, z=0.0,
+             raw_im=None, preprocess=True,
+             scale=3.0, n_samples=1, ddim_steps=50, ddim_eta=1.0,
+             precision='fp32', h=256, w=256):
+    '''
+    :param raw_im (PIL Image).
+    '''
+    
+#     raw_im.thumbnail([1536, 1536], Image.Resampling.LANCZOS)
+#     safety_checker_input = models['clip_fe'](raw_im, return_tensors='pt').to(device)
+#     (image, has_nsfw_concept) = models['nsfw'](
+#         images=np.ones((1, 3)), clip_input=safety_checker_input.pixel_values)
+#     print('has_nsfw_concept:', has_nsfw_concept)
+#     if np.any(has_nsfw_concept):
+#         print('NSFW content detected.')
+#         to_return = [None] * 10
+#         description = ('###  <span style="color:red"> Unfortunately, '
+#                        'potential NSFW content was detected, '
+#                        'which is not supported by our model. '
+#                        'Please try again with a different image. </span>')
+#         if 'angles' in return_what:
+#             to_return[0] = 0.0
+#             to_return[1] = 0.0
+#             to_return[2] = 0.0
+#             to_return[3] = description
+#         else:
+#             to_return[0] = description
+#         return to_return
+
+#     else:
+#         print('Safety check passed.')
+
+    input_im = preprocess_image(models, raw_im, preprocess)
+
+    # if np.random.rand() < 0.3:
+    #     description = ('Unfortunately, a human, a face, or potential NSFW content was detected, '
+    #                    'which is not supported by our model.')
+    #     if vis_only:
+    #         return (None, None, description)
+    #     else:
+    #         return (None, None, None, description)
+
+    show_in_im1 = (input_im * 255.0).astype(np.uint8)
+    show_in_im2 = Image.fromarray(show_in_im1)
+
+    # if 'rand' in return_what:
+    #     x = int(np.round(np.arcsin(np.random.uniform(-1.0, 1.0)) * 160.0 / np.pi))  # [-80, 80].
+    #     y = int(np.round(np.random.uniform(-150.0, 150.0)))
+    #     z = 0.0
+
+    # cam_vis.polar_change(x)
+    # cam_vis.azimuth_change(y)
+    # cam_vis.radius_change(z)
+    # cam_vis.encode_image(show_in_im1)
+    # new_fig = cam_vis.update_figure()
+
+#     if 'vis' in return_what:
+#         description = ('The viewpoints are visualized on the top right. '
+#                        'Click Run Generation to update the results on the bottom right.')
+
+#         if 'angles' in return_what:
+#             return (x, y, z, description, new_fig, show_in_im2)
+#         else:
+#             return (description, new_fig, show_in_im2)
+
+    input_im = transforms.ToTensor()(input_im).unsqueeze(0).to(device)
+    input_im = input_im * 2 - 1
+    input_im = transforms.functional.resize(input_im, [h, w])
+
+    sampler = DDIMSampler(models['turncam'])
+    # used_x = -x  # NOTE: Polar makes more sense in Basile's opinion this way!
+    used_x = x  # NOTE: Set this way for consistency.
+    x_samples_ddim = sample_model(input_im, models['turncam'], sampler, precision, h, w,
+                                  ddim_steps, n_samples, scale, ddim_eta, used_x, y, z)
+
+    output_ims = []
+    for x_sample in x_samples_ddim:
+        x_sample = 255.0 * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+        output_ims.append(Image.fromarray(x_sample.astype(np.uint8)))
+
+    description = None
+    return output_ims
+        # if 'angles' in return_what:
+        #     return (x, y, z, description, new_fig, show_in_im2, output_ims)
+        # else:
+        #     return (description, new_fig, show_in_im2, output_ims)
+
 def main_run(models, device, cam_vis, return_what,
              x=0.0, y=0.0, z=0.0,
              raw_im=None, preprocess=True,
@@ -399,6 +526,88 @@ def main_run(models, device, cam_vis, return_what,
             return (description, new_fig, show_in_im2, output_ims)
 
 
+def get_camera_loc(polar_deg, azimuth_deg, radius_m):
+    polar_rad = np.deg2rad(polar_deg)
+    azimuth_rad = np.deg2rad(azimuth_deg)
+    # return to_sphere_theta_phi(azimuth_deg, -polar_deg + pi/2) * radius_m
+    
+    polar_rad = -polar_rad  # NOTE: Inverse of how used_x relates to x.
+
+    
+    # Camera pose center:
+    cam_x = radius_m * np.cos(azimuth_rad) * np.cos(polar_rad)
+    cam_y = radius_m * np.sin(azimuth_rad) * np.cos(polar_rad)
+    cam_z = radius_m * np.sin(polar_rad)
+    return np.array([cam_x, cam_y, cam_z])
+
+    
+
+
+def to_sphere_theta_phi(theta, phi):
+  """Get coordinates on unit sphere given theta, phi.
+
+  Args:
+    theta: yaw angle in [0, 2pi)
+    phi: pitch angle in (0, pi)
+  Returns:
+    coordinates on sphere in [-1, 1]^3
+  """
+  assert theta.ndim == 0
+  assert phi.ndim == 0
+  return np.array([
+      np.sin(phi)*np.cos(theta),
+      np.sin(phi)*np.sin(theta),
+      np.cos(phi)
+  ])
+
+
+def from_sphere_theta_phi(coords):
+  x, y, z = coords
+  theta = np.arctan2(y, x)
+  theta = _get_positive_radians(theta)
+
+  phi = np.arccos(z)
+  return theta, phi
+
+def _get_positive_radians(angle):
+  angle = (angle + 2*np.pi) % (2*np.pi)
+  return angle
+
+
+def inv_get_camera_loc(xyz):
+    # since get_camera_loc(phi, theta) == to_sphere_theta_phi(theta, phi + pi/2)
+    # we have 
+    # inv_get_camera_loc(loc) == from_sphere_theta_phi(loc) - pi/2
+    
+    assert xyz.shape == (3,)
+    radius = np.linalg.norm(xyz)
+    xyz /= radius
+    
+    theta, phi = from_sphere_theta_phi(xyz)
+    theta = np.rad2deg(theta)
+    phi = np.rad2deg(phi - np.pi/2)
+    return phi, theta, radius
+    
+    # azimuth_rad = np.arctan2(y,x)
+    # azimuth_rad = _get_positive_radians(azimuth_rad)
+    # polar_rad = np.arccos(z) - np.pi/2
+    # return np.rad2deg(polar_rad), np.rad2deg(azimuth_rad), radius
+    
+    
+    # Obtain four corners of camera frustum, assuming it is looking at origin.
+    # First, obtain camera extrinsics (rotation matrix only):
+    # camera_R = np.array([[np.cos(azimuth_rad) * np.cos(polar_rad),
+    #                       -np.sin(azimuth_rad),
+    #                       -np.cos(azimuth_rad) * np.sin(polar_rad)],
+    #                      [np.sin(azimuth_rad) * np.cos(polar_rad),
+    #                       np.cos(azimuth_rad),
+    #                       -np.sin(azimuth_rad) * np.sin(polar_rad)],
+    #                      [np.sin(polar_rad),
+    #                       0.0,
+    #                       np.cos(polar_rad)]])
+    # return camera_R
+
+        
 def calc_cam_cone_pts_3d(polar_deg, azimuth_deg, radius_m, fov_deg):
     '''
     :param polar_deg (float).
@@ -464,6 +673,40 @@ def calc_cam_cone_pts_3d(polar_deg, azimuth_deg, radius_m, fov_deg):
 
     return np.array([xs, ys, zs]).T
 
+
+def get_state():
+    device_idx=_GPU_INDEX
+    ckpt='105000.ckpt'
+    config='configs/sd-objaverse-finetune-c_concat-256.yaml'
+    
+    device = f'cuda:{device_idx}'
+    config = OmegaConf.load(config)
+
+    # Instantiate all models beforehand for efficiency.
+    models = dict()
+    print('Instantiating LatentDiffusion...')
+    models['turncam'] = load_model_from_config(config, ckpt, device=device)
+    print('Instantiating Carvekit HiInterface...')
+    models['carvekit'] = create_carvekit_interface()
+    print('Instantiating StableDiffusionSafetyChecker...')
+    models['nsfw'] = StableDiffusionSafetyChecker.from_pretrained(
+        'CompVis/stable-diffusion-safety-checker').to(device)
+    print('Instantiating AutoFeatureExtractor...')
+    models['clip_fe'] = AutoFeatureExtractor.from_pretrained(
+        'CompVis/stable-diffusion-safety-checker')
+
+    # Reduce NSFW false positives.
+    # NOTE: At the time of writing, and for diffusers 0.12.1, the default parameters are:
+    # models['nsfw'].concept_embeds_weights:
+    # [0.1800, 0.1900, 0.2060, 0.2100, 0.1950, 0.1900, 0.1940, 0.1900, 0.1900, 0.2200, 0.1900,
+    #  0.1900, 0.1950, 0.1984, 0.2100, 0.2140, 0.2000].
+    # models['nsfw'].special_care_embeds_weights:
+    # [0.1950, 0.2000, 0.2200].
+    # We multiply all by some factor > 1 to make them less likely to be triggered.
+    models['nsfw'].concept_embeds_weights *= 1.07
+    models['nsfw'].special_care_embeds_weights *= 1.07
+    return locals()
+    
 
 def run_demo(
         device_idx=_GPU_INDEX,
